@@ -1,0 +1,237 @@
+---
+- name: Install and configure OpenBao with SoftHSM
+  hosts: all
+  become: true
+
+  vars:
+    arch_map:
+      x86_64: amd64
+      aarch64: arm64
+
+    openbao_version: "2.5.1"
+    openbao_arch: "{{ arch_map[ansible_architecture] }}"
+    openbao_filename: "openbao-hsm_{{ openbao_version }}_linux_{{ openbao_arch }}"
+    openbao_url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/{{ openbao_filename }}"
+
+    softhsm_token_label: "openbao-token"
+    softhsm_pin: "123456"
+    softhsm_so_pin: "123456"
+    softhsm_key_label: "bao-root-key"
+    softhsm_key_type: "aes:32"
+
+  tasks:
+    - name: Set OpenBao environment
+      ansible.builtin.copy:
+        dest: /etc/profile.d/66-set-bao-addr.sh
+        mode: "0644"
+        content: |
+          export BAO_ADDR=http://127.0.0.1:8200
+
+    - name: Debian
+      when: ansible_facts['os_family'] == "Debian"
+      block:
+        - name: Ensure SoftHSM (Debian)
+          ansible.builtin.apt:
+            name:
+              - softhsm2
+              - opensc
+            state: present
+            update_cache: yes
+            cache_valid_time: 3600
+
+        - name: Download OpenBao package (Debian)
+          ansible.builtin.get_url:
+            url: "{{ openbao_url }}.deb"
+            dest: "/tmp/{{ openbao_filename }}.deb"
+            mode: "0644"
+
+        - name: Ensure OpenBao (Debian)
+          ansible.builtin.apt:
+            deb: "/tmp/{{ openbao_filename }}.deb"
+            state: present
+
+    - name: EL
+      when: ansible_facts['os_family'] == "RedHat"
+      block:
+        - name: Ensure SoftHSM (EL)
+          ansible.builtin.dnf:
+            name:
+              - softhsm
+              - opensc
+            state: present
+
+        - name: Download OpenBao package (EL)
+          ansible.builtin.get_url:
+            url: "{{ openbao_url }}.rpm"
+            dest: "/tmp/{{ openbao_filename }}.rpm"
+            mode: "0644"
+
+        - name: Ensure OpenBao (EL)
+          ansible.builtin.dnf:
+            name: "/tmp/{{ openbao_filename }}.rpm"
+            state: present
+            disable_gpg_check: true
+
+    - name: Locate SoftHSM PKCS#11 library
+      ansible.builtin.find:
+        paths:
+          - /usr/lib
+          - /usr/lib64
+        patterns: libsofthsm2.so
+        recurse: yes
+      register: softhsm_libs
+      tags: debug
+
+    - name: Fail if SoftHSM library not found
+      ansible.builtin.fail:
+        msg: "Could not find libsofthsm2.so on system"
+      when: softhsm_libs.matched == 0
+      tags: debug
+
+    - name: Prefer canonical SoftHSM path
+      ansible.builtin.set_fact:
+        pkcs11_module: >-
+          {{
+            (softhsm_libs.files
+            | map(attribute='path')
+            | select('search', 'softhsm/libsofthsm2.so')
+            | list
+            | first)
+            | default(softhsm_libs.files[0].path)
+          }}
+      tags: debug
+
+    - name: Debug pkcs11_module (verbosity 1)
+      ansible.builtin.debug:
+        var: pkcs11_module
+        verbosity: 1
+      tags: debug
+
+    - name: Check existing SoftHSM slots
+      ansible.builtin.command: softhsm2-util --show-slots
+      register: softhsm_slots
+      changed_when: false
+
+    - name: Debug slots (verbosity 1)
+      ansible.builtin.debug:
+        var: softhsm_slots
+        verbosity: 1
+
+    - name: Initialize SoftHSM token  # noqa: no-changed-when
+      ansible.builtin.command: >
+        softhsm2-util
+        --init-token
+        --slot 0
+        --label {{ softhsm_token_label }}
+        --pin {{ softhsm_pin }}
+        --so-pin {{ softhsm_so_pin }}
+      when: softhsm_token_label not in softhsm_slots.stdout
+
+    - name: Check existing PKCS#11 objects
+      ansible.builtin.command: >
+        pkcs11-tool
+        --module {{ pkcs11_module }}
+        --token-label {{ softhsm_token_label }}
+        --pin {{ softhsm_pin }}
+        -O
+      register: pkcs11_objects
+      changed_when: false
+      failed_when: false
+
+    - name: Generate AES key in SoftHSM  # noqa: no-changed-when
+      ansible.builtin.command: >
+        pkcs11-tool
+        --module {{ pkcs11_module }}
+        --token-label {{ softhsm_token_label }}
+        --pin {{ softhsm_pin }}
+        --keygen
+        --key-type {{ softhsm_key_type }}
+        --label {{ softhsm_key_label }}
+      when: softhsm_key_label not in pkcs11_objects.stdout
+
+    - name: Ensure softhsm group exists
+      ansible.builtin.group:
+        name: softhsm
+        state: present
+
+    - name: Ensure openbao user is in softhsm group
+      ansible.builtin.user:
+        name: openbao
+        groups: softhsm
+        append: yes
+
+    - name: Set directory permissions on SoftHSM tokens
+      ansible.builtin.file:
+        path: /var/lib/softhsm
+        state: directory
+        owner: openbao
+        group: softhsm
+        mode: '2770'
+        recurse: yes
+
+    - name: Find SoftHSM token files
+      ansible.builtin.find:
+        paths: /var/lib/softhsm/tokens
+        recurse: true
+        file_type: file
+      register: softhsm_token_files
+
+    - name: Ensure correct permissions on SoftHSM token files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "0660"
+        owner: openbao
+        group: softhsm
+      loop: "{{ softhsm_token_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Create OpenBao config directory
+      ansible.builtin.file:
+        path: /etc/openbao
+        state: directory
+        mode: "0755"
+
+    - name: Configure OpenBao PKCS#11 seal
+      ansible.builtin.copy:
+        dest: /etc/openbao/openbao.hcl
+        mode: "0640"
+        content: |
+          api_addr = "http://127.0.0.1:8200"
+
+          listener "tcp" {
+            address     = "127.0.0.1:8200"
+            tls_disable = "true"
+          }
+
+          storage "file" {
+            path    = "/opt/openbao/data"
+          }
+
+          seal "pkcs11" {
+            lib         = "{{ pkcs11_module }}"
+            pin         = "{{ softhsm_pin }}"
+            token_label = "{{ softhsm_token_label }}"
+            key_label   = "{{ softhsm_key_label }}"
+          }
+      notify: Restart OpenBao
+
+    - name: Ensure OpenBao data directory exists
+      ansible.builtin.file:
+        path: /opt/openbao/data
+        state: directory
+        owner: openbao
+        group: openbao
+        mode: "0750"
+
+    - name: Start and enable OpenBao service
+      ansible.builtin.systemd:
+        name: openbao
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart OpenBao
+      ansible.builtin.systemd:
+        name: openbao
+        state: restarted
