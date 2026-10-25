@@ -8,69 +8,296 @@
       x86_64: amd64
       aarch64: arm64
 
-    openbao_version: "2.5.1"
+    openbao_version: "2.7.1"
     openbao_arch: "{{ arch_map[ansible_architecture] }}"
-    openbao_filename: "openbao-hsm_{{ openbao_version }}_linux_{{ openbao_arch }}"
-    openbao_url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/{{ openbao_filename }}"
+    openbao_filename: "openbao_{{ openbao_version }}_linux_{{ openbao_arch }}"
+    openbao_url: >-
+      https://github.com/openbao/openbao/releases/download/v{{
+      openbao_version }}/{{ openbao_filename }}
+    openbao_checksums:
+      amd64: "698970b7e58590bd0ceb55043ce6f5e5d53e67b4a825e296cc197b21d6a6d700"
+      arm64: "3ea0d10a9a44a2cda37d43ad6d1adf80dd4a1c72a1fe0de890b07d0af5354a34"
+
+    pkcs11_plugin_version: "0.2.1"
+    pkcs11_plugin_filename: >-
+      openbao-plugin-kms-pkcs11_linux_{{ openbao_arch }}_v1.tar.gz
+    pkcs11_plugin_binary: "openbao-plugin-kms-pkcs11_linux_{{ openbao_arch }}_v1"
+    pkcs11_plugin_url: >-
+      https://github.com/openbao/openbao-plugins/releases/download/kms-pkcs11-v{{
+      pkcs11_plugin_version }}/{{ pkcs11_plugin_filename }}
+    pkcs11_plugin_checksums:
+      amd64: "ed18e461bb2bf13e644194711f72aed79524fda8a7c212e8a2ef8548be761497"
+      arm64: "d402f8857a88764abd8ab5b6ee7310e982873cc2b19a613d4da644a821aad3e1"
+
+    # Upstream plugin release binaries are dynamically linked against
+    # glibc >= 2.32/2.34. On EL8 (glibc 2.28) the plugin must be built
+    # from source; the playbook detects this via ldd and falls back to
+    # a pinned-tag source build with the Go toolchain below.
+    go_version: "1.27.3"
+    go_checksums:
+      amd64: "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+      arm64: "a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
+    go_tarball: "go{{ go_version }}.linux-{{ openbao_arch }}.tar.gz"
+    pkcs11_plugin_repo: "https://github.com/openbao/openbao-plugins"
+    pkcs11_plugin_ref: "kms-pkcs11-v{{ pkcs11_plugin_version }}"
+    pkcs11_plugin_src: /usr/local/src/openbao-plugins
+
+    # EL8 ships SoftHSM 2.6.1, whose C_EncryptInit/C_DecryptInit abort on
+    # CKM_AES_GCM with an empty AAD (OpenBao always sends empty AAD):
+    # ByteString::operator[] bounds assert under EL8's hardened libstdc++.
+    # Fixed upstream in SoftHSM 2.7.0, so build it into /usr/local and
+    # point the OpenBao seal at that library.
+    softhsm_version: "2.7.0"
+    softhsm_tarball: "softhsm-{{ softhsm_version }}-src.tar.gz"
+    softhsm_url: >-
+      https://github.com/softhsm/SoftHSMv2/archive/refs/tags/{{
+      softhsm_version }}.tar.gz
+    softhsm_sha256: "be14a5820ec457eac5154462ffae51ba5d8a643f6760514d4b4b83a77be91573"
+    softhsm_src: /usr/local/src/SoftHSMv2-{{ softhsm_version }}
+    softhsm_local_lib: /usr/local/lib/softhsm/libsofthsm2.so
+
+    openbao_hcl: /etc/openbao/openbao.hcl
+    openbao_tls_dir: /etc/openbao/tls
+    openbao_data_dir: /opt/openbao/data
+    openbao_plugin_dir: /opt/openbao/plugins
+    openbao_api_addr: "https://127.0.0.1:8200"
+    openbao_tls_cn: "openbao.test.local"
+    openbao_tls_sans:
+      - "DNS:openbao.test.local"
+      - "DNS:localhost"
+      - "IP:127.0.0.1"
 
     softhsm_token_label: "openbao-token"
-    softhsm_pin: "123456"
-    softhsm_so_pin: "123456"
+    softhsm_pin: "246810"
+    softhsm_so_pin: "246810"
     softhsm_key_label: "bao-root-key"
     softhsm_key_type: "aes:32"
 
+  pre_tasks:
+    - name: Verify architecture is supported
+      ansible.builtin.assert:
+        that: openbao_arch in openbao_checksums
+        fail_msg: "Unsupported architecture: {{ ansible_architecture }}"
+
   tasks:
-    - name: Set OpenBao environment
+    - name: Set OpenBao client environment for login shells
       ansible.builtin.copy:
         dest: /etc/profile.d/66-set-bao-addr.sh
         mode: "0644"
         content: |
-          export BAO_ADDR=http://127.0.0.1:8200
+          export BAO_ADDR={{ openbao_api_addr }}
+          export BAO_CACERT={{ openbao_tls_dir }}/coreCA.crt
 
-    - name: Debian
-      when: ansible_facts['os_family'] == "Debian"
+    - name: Ensure SoftHSM and OpenSC (EL)
+      ansible.builtin.dnf:
+        name:
+          - softhsm
+          - opensc
+        state: present
+
+    - name: Build SoftHSM {{ softhsm_version }} from source
       block:
-        - name: Ensure SoftHSM (Debian)
-          ansible.builtin.apt:
-            name:
-              - softhsm2
-              - opensc
-            state: present
-            update_cache: yes
-            cache_valid_time: 3600
-
-        - name: Download OpenBao package (Debian)
-          ansible.builtin.get_url:
-            url: "{{ openbao_url }}.deb"
-            dest: "/tmp/{{ openbao_filename }}.deb"
-            mode: "0644"
-
-        - name: Ensure OpenBao (Debian)
-          ansible.builtin.apt:
-            deb: "/tmp/{{ openbao_filename }}.deb"
-            state: present
-
-    - name: EL
-      when: ansible_facts['os_family'] == "RedHat"
-      block:
-        - name: Ensure SoftHSM (EL)
+        - name: Ensure SoftHSM build dependencies
           ansible.builtin.dnf:
             name:
-              - softhsm
-              - opensc
+              - gcc
+              - gcc-c++
+              - make
+              - autoconf
+              - automake
+              - libtool
+              - openssl-devel
             state: present
 
-        - name: Download OpenBao package (EL)
+        - name: Download SoftHSM source
           ansible.builtin.get_url:
-            url: "{{ openbao_url }}.rpm"
-            dest: "/tmp/{{ openbao_filename }}.rpm"
+            url: "{{ softhsm_url }}"
+            dest: "/tmp/{{ softhsm_tarball }}"
+            mode: "0644"
+            checksum: "sha256:{{ softhsm_sha256 }}"
+
+        - name: Unpack SoftHSM source
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ softhsm_tarball }}"
+            dest: /usr/local/src
+            remote_src: true
+            creates: "{{ softhsm_src }}"
+
+        - name: Autoreconf SoftHSM source  # noqa: no-changed-when
+          ansible.builtin.command:
+            cmd: autoreconf -fi
+            chdir: "{{ softhsm_src }}"
+            creates: "{{ softhsm_src }}/configure"
+
+        - name: Configure SoftHSM  # noqa: no-changed-when
+          ansible.builtin.command:
+            cmd: ./configure --prefix=/usr/local
+            chdir: "{{ softhsm_src }}"
+            creates: "{{ softhsm_src }}/Makefile"
+
+        - name: Compile SoftHSM  # noqa: no-changed-when
+          ansible.builtin.command:
+            cmd: "make -j{{ ansible_processor_vcpus | default(2) }}"
+            chdir: "{{ softhsm_src }}"
+            creates: "{{ softhsm_src }}/src/lib/.libs/libsofthsm2.so"
+
+        - name: Install SoftHSM to /usr/local  # noqa: no-changed-when
+          ansible.builtin.command:
+            cmd: make install
+            chdir: "{{ softhsm_src }}"
+            creates: "{{ softhsm_local_lib }}"
+
+        - name: Point SoftHSM config at system token directory
+          ansible.builtin.lineinfile:
+            path: /usr/local/etc/softhsm2.conf
+            regexp: "^directories.tokendir"
+            line: "directories.tokendir = /var/lib/softhsm/tokens"
+            create: true
             mode: "0644"
 
-        - name: Ensure OpenBao (EL)
+        - name: Ensure locally built SoftHSM library permissions
+          ansible.builtin.file:
+            path: "{{ softhsm_local_lib }}"
+            mode: "0755"
+
+    - name: Download OpenBao package (EL)
+      ansible.builtin.get_url:
+        url: "{{ openbao_url }}.rpm"
+        dest: "/tmp/{{ openbao_filename }}.rpm"
+        mode: "0644"
+        checksum: "sha256:{{ openbao_checksums[openbao_arch] }}"
+
+    - name: Ensure OpenBao (EL)
+      ansible.builtin.dnf:
+        name: "/tmp/{{ openbao_filename }}.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Stat installed PKCS#11 plugin
+      ansible.builtin.stat:
+        path: "{{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+      register: plugin_installed
+
+    - name: Install upstream PKCS#11 plugin release binary
+      when: not plugin_installed.stat.exists
+      block:
+        - name: Download OpenBao PKCS#11 plugin
+          ansible.builtin.get_url:
+            url: "{{ pkcs11_plugin_url }}"
+            dest: "/tmp/{{ pkcs11_plugin_filename }}"
+            mode: "0644"
+            checksum: "sha256:{{ pkcs11_plugin_checksums[openbao_arch] }}"
+
+        - name: Unpack OpenBao PKCS#11 plugin
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ pkcs11_plugin_filename }}"
+            dest: "{{ openbao_plugin_dir }}"
+            remote_src: true
+            creates: "{{ openbao_plugin_dir }}/{{ pkcs11_plugin_binary }}"
+
+        - name: Rename plugin binary for OpenBao  # noqa: no-changed-when
+          ansible.builtin.command:
+            cmd: >-
+              mv {{ openbao_plugin_dir }}/{{ pkcs11_plugin_binary }}
+              {{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11
+            creates: "{{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+
+    - name: Clean plugin archive leftovers
+      ansible.builtin.file:
+        path: "{{ openbao_plugin_dir }}/{{ item }}"
+        state: absent
+      loop:
+        - "{{ pkcs11_plugin_binary }}"
+        - LICENSE
+
+    - name: Stat plugin after install
+      ansible.builtin.stat:
+        path: "{{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+      register: plugin_final
+
+    - name: Check plugin dynamic linking compatibility
+      ansible.builtin.command:
+        cmd: "ldd {{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+      when: plugin_final.stat.exists
+      register: plugin_ldd
+      changed_when: false
+      failed_when: false
+
+    - name: Flag plugin for source build if missing or glibc incompatible
+      ansible.builtin.set_fact:
+        plugin_needs_build: >-
+          {{ (not plugin_final.stat.exists)
+          or ('not found' in (plugin_ldd.stdout | default(''))) }}
+
+    - name: Build plugin from source for older glibc
+      when: plugin_needs_build
+      block:
+        - name: Ensure build dependencies
           ansible.builtin.dnf:
-            name: "/tmp/{{ openbao_filename }}.rpm"
+            name:
+              - git
+              - gcc
+              - make
             state: present
-            disable_gpg_check: true
+
+        - name: Download Go toolchain
+          ansible.builtin.get_url:
+            url: "https://go.dev/dl/{{ go_tarball }}"
+            dest: "/tmp/{{ go_tarball }}"
+            mode: "0644"
+            checksum: "sha256:{{ go_checksums[openbao_arch] }}"
+
+        - name: Install Go toolchain
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ go_tarball }}"
+            dest: /usr/local
+            remote_src: true
+            creates: /usr/local/go/bin/go
+
+        - name: Remove incompatible release plugin binary  # noqa: no-changed-when
+          ansible.builtin.file:
+            path: "{{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+            state: absent
+
+        - name: Clean plugin archive leftovers
+          ansible.builtin.file:
+            path: "{{ openbao_plugin_dir }}/{{ item }}"
+            state: absent
+          loop:
+            - "{{ pkcs11_plugin_binary }}"
+            - LICENSE
+
+        - name: Clone plugin sources at pinned tag
+          ansible.builtin.git:
+            repo: "{{ pkcs11_plugin_repo }}"
+            dest: "{{ pkcs11_plugin_src }}"
+            version: "{{ pkcs11_plugin_ref }}"
+            depth: 1
+
+        - name: Build PKCS#11 plugin from source  # noqa: no-changed-when
+          ansible.builtin.command:
+            cmd: >-
+              /usr/local/go/bin/go build
+              -o {{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11 ./cmd
+            chdir: "{{ pkcs11_plugin_src }}/kms/pkcs11"
+            creates: "{{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+          environment:
+            PATH: "/usr/local/go/bin:{{ ansible_env.PATH }}"
+
+    - name: Ensure plugin file permissions
+      ansible.builtin.file:
+        path: "{{ openbao_plugin_dir }}/openbao-plugin-kms-pkcs11"
+        owner: openbao
+        group: openbao
+        mode: "0755"
+
+    - name: Ensure plugin directory permissions
+      ansible.builtin.file:
+        path: "{{ openbao_plugin_dir }}"
+        state: directory
+        owner: openbao
+        group: openbao
+        mode: "0755"
 
     - name: Locate SoftHSM PKCS#11 library
       ansible.builtin.find:
@@ -78,44 +305,29 @@
           - /usr/lib
           - /usr/lib64
         patterns: libsofthsm2.so
-        recurse: yes
+        recurse: true
       register: softhsm_libs
-      tags: debug
 
     - name: Fail if SoftHSM library not found
       ansible.builtin.fail:
         msg: "Could not find libsofthsm2.so on system"
       when: softhsm_libs.matched == 0
-      tags: debug
 
-    - name: Prefer canonical SoftHSM path
+    - name: Check for locally built SoftHSM library
+      ansible.builtin.stat:
+        path: "{{ softhsm_local_lib }}"
+      register: softhsm_patched
+
+    - name: Select PKCS#11 module for the OpenBao seal
       ansible.builtin.set_fact:
         pkcs11_module: >-
-          {{
-            (softhsm_libs.files
-            | map(attribute='path')
-            | select('search', 'softhsm/libsofthsm2.so')
-            | list
-            | first)
-            | default(softhsm_libs.files[0].path)
-          }}
-      tags: debug
-
-    - name: Debug pkcs11_module (verbosity 1)
-      ansible.builtin.debug:
-        var: pkcs11_module
-        verbosity: 1
-      tags: debug
+          {{ softhsm_local_lib if softhsm_patched.stat.exists
+          else (softhsm_libs.files | map(attribute='path') | first) }}
 
     - name: Check existing SoftHSM slots
       ansible.builtin.command: softhsm2-util --show-slots
       register: softhsm_slots
       changed_when: false
-
-    - name: Debug slots (verbosity 1)
-      ansible.builtin.debug:
-        var: softhsm_slots
-        verbosity: 1
 
     - name: Initialize SoftHSM token  # noqa: no-changed-when
       ansible.builtin.command: >
@@ -158,16 +370,18 @@
       ansible.builtin.user:
         name: openbao
         groups: softhsm
-        append: yes
+        append: true
 
     - name: Set directory permissions on SoftHSM tokens
       ansible.builtin.file:
-        path: /var/lib/softhsm
+        path: "{{ item }}"
         state: directory
         owner: openbao
         group: softhsm
-        mode: '2770'
-        recurse: yes
+        mode: "2770"
+      loop:
+        - /var/lib/softhsm
+        - /var/lib/softhsm/tokens
 
     - name: Find SoftHSM token files
       ansible.builtin.find:
@@ -179,9 +393,8 @@
     - name: Ensure correct permissions on SoftHSM token files
       ansible.builtin.file:
         path: "{{ item.path }}"
-        mode: "0660"
+        mode: "0600"
         owner: openbao
-        group: softhsm
       loop: "{{ softhsm_token_files.files }}"
       loop_control:
         label: "{{ item.path }}"
@@ -190,22 +403,128 @@
       ansible.builtin.file:
         path: /etc/openbao
         state: directory
-        mode: "0755"
+        owner: openbao
+        group: openbao
+        mode: "0750"
 
-    - name: Configure OpenBao PKCS#11 seal
+    - name: Create OpenBao TLS directory
+      ansible.builtin.file:
+        path: "{{ openbao_tls_dir }}"
+        state: directory
+        owner: openbao
+        group: openbao
+        mode: "0750"
+
+    - name: Check for existing TLS server certificate
+      ansible.builtin.stat:
+        path: "{{ openbao_tls_dir }}/server.crt"
+      register: tls_server_crt
+
+    - name: Generate internal CA and TLS certificate
+      when: not tls_server_crt.stat.exists
+      block:
+        - name: Generate internal CA key
+          ansible.builtin.command: >
+            openssl genrsa -out {{ openbao_tls_dir }}/coreCA.key 4096
+          args:
+            creates: "{{ openbao_tls_dir }}/coreCA.key"
+
+        - name: Generate internal CA certificate
+          ansible.builtin.command: >
+            openssl req -x509 -new -nodes
+            -key {{ openbao_tls_dir }}/coreCA.key
+            -sha256 -days 3650
+            -subj "/CN=OpenBao Core CA"
+            -out {{ openbao_tls_dir }}/coreCA.crt
+          args:
+            creates: "{{ openbao_tls_dir }}/coreCA.crt"
+
+        - name: Generate TLS server key
+          ansible.builtin.command: >
+            openssl genrsa -out {{ openbao_tls_dir }}/server.key 4096
+          args:
+            creates: "{{ openbao_tls_dir }}/server.key"
+
+        - name: Generate TLS server CSR
+          ansible.builtin.command: >
+            openssl req -new
+            -key {{ openbao_tls_dir }}/server.key
+            -subj "/CN={{ openbao_tls_cn }}"
+            -out /tmp/openbao-server.csr
+          args:
+            creates: /tmp/openbao-server.csr
+
+        - name: Generate TLS server certificate  # noqa: no-changed-when
+          ansible.builtin.command: >
+            openssl x509 -req
+            -in /tmp/openbao-server.csr
+            -CA {{ openbao_tls_dir }}/coreCA.crt
+            -CAkey {{ openbao_tls_dir }}/coreCA.key
+            -CAcreateserial
+            -days 3650 -sha256
+            -extfile /dev/stdin
+            -out {{ openbao_tls_dir }}/server.crt
+          args:
+            stdin: |
+              basicConstraints = CA:FALSE
+              keyUsage = digitalSignature, keyEncipherment
+              extendedKeyUsage = serverAuth
+              subjectAltName = {{ openbao_tls_sans | join(', ') }}
+            creates: "{{ openbao_tls_dir }}/server.crt"
+
+        - name: Remove TLS CSR
+          ansible.builtin.file:
+            path: /tmp/openbao-server.csr
+            state: absent
+
+    - name: Ensure TLS file permissions
+      ansible.builtin.file:
+        path: "{{ openbao_tls_dir }}/{{ item }}"
+        owner: openbao
+        group: openbao
+        mode: "{{ '0600' if 'key' in item else '0644' }}"
+      loop:
+        - coreCA.key
+        - coreCA.crt
+        - server.key
+        - server.crt
+
+    - name: Trust internal CA system-wide
       ansible.builtin.copy:
-        dest: /etc/openbao/openbao.hcl
+        src: "{{ openbao_tls_dir }}/coreCA.crt"
+        dest: /etc/pki/ca-trust/source/anchors/coreCA.crt
+        mode: "0644"
+        remote_src: true
+      notify: Update CA trust
+
+    - name: Configure OpenBao server
+      ansible.builtin.copy:
+        dest: "{{ openbao_hcl }}"
+        owner: root
+        group: openbao
         mode: "0640"
         content: |
-          api_addr = "http://127.0.0.1:8200"
+          ui = true
+
+          api_addr     = "{{ openbao_api_addr }}"
+          cluster_addr = "https://127.0.0.1:8201"
+
+          plugin_directory = "{{ openbao_plugin_dir }}"
 
           listener "tcp" {
-            address     = "127.0.0.1:8200"
-            tls_disable = "true"
+            address         = "0.0.0.0:8200"
+            cluster_address = "127.0.0.1:8201"
+            tls_cert_file   = "{{ openbao_tls_dir }}/server.crt"
+            tls_key_file    = "{{ openbao_tls_dir }}/server.key"
           }
 
-          storage "file" {
-            path    = "/opt/openbao/data"
+          storage "raft" {
+            path    = "{{ openbao_data_dir }}"
+            node_id = "openbao-1"
+          }
+
+          plugin "kms" "pkcs11" {
+            command = "openbao-plugin-kms-pkcs11"
           }
 
           seal "pkcs11" {
@@ -218,7 +537,7 @@
 
     - name: Ensure OpenBao data directory exists
       ansible.builtin.file:
-        path: /opt/openbao/data
+        path: "{{ openbao_data_dir }}"
         state: directory
         owner: openbao
         group: openbao
@@ -230,8 +549,96 @@
         state: started
         enabled: true
 
+    - name: Wait for OpenBao API to come up
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8200
+        timeout: 60
+
+    - name: Query OpenBao status
+      ansible.builtin.command: bao status -format=json
+      environment:
+        BAO_ADDR: "{{ openbao_api_addr }}"
+        BAO_CACERT: "{{ openbao_tls_dir }}/coreCA.crt"
+      register: bao_status_pre
+      changed_when: false
+      failed_when: false
+
+    - name: Initialize OpenBao with PKCS#11 auto-unseal
+      when: not (bao_status_pre.stdout | from_json).initialized | default(true)
+      block:
+        - name: Run OpenBao initialization  # noqa: no-changed-when
+          ansible.builtin.command: >
+            bao operator init
+            -recovery-shares=1
+            -recovery-threshold=1
+            -format=json
+          environment:
+            BAO_ADDR: "{{ openbao_api_addr }}"
+            BAO_CACERT: "{{ openbao_tls_dir }}/coreCA.crt"
+          register: bao_init
+          no_log: true
+
+        - name: Save initial credentials (root-only)
+          ansible.builtin.copy:
+            dest: /root/init.json
+            content: "{{ bao_init.stdout }}"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+    - name: Read root token for management tasks
+      ansible.builtin.set_fact:
+        bao_root_token: >-
+          {{ (bao_init.stdout | from_json).root_token
+          if bao_init.changed | default(false)
+          else (lookup('ansible.builtin.file', '/root/init.json') | from_json).root_token }}
+      no_log: true
+
+    - name: Read mounted secret engines
+      ansible.builtin.command: bao secrets list -format=json
+      environment:
+        BAO_ADDR: "{{ openbao_api_addr }}"
+        BAO_CACERT: "{{ openbao_tls_dir }}/coreCA.crt"
+        BAO_TOKEN: "{{ bao_root_token }}"
+      register: bao_mounts
+      changed_when: false
+
+    - name: Enable KV v2 secrets engine at secret/  # noqa: no-changed-when
+      ansible.builtin.command: bao secrets enable -path=secret kv-v2
+      environment:
+        BAO_ADDR: "{{ openbao_api_addr }}"
+        BAO_CACERT: "{{ openbao_tls_dir }}/coreCA.crt"
+        BAO_TOKEN: "{{ bao_root_token }}"
+      when: "'secret/' not in (bao_mounts.stdout | from_json | default({}))"
+
+    - name: Read OpenBao status after initialization
+      ansible.builtin.command: bao status -format=json
+      environment:
+        BAO_ADDR: "{{ openbao_api_addr }}"
+        BAO_CACERT: "{{ openbao_tls_dir }}/coreCA.crt"
+      register: bao_status_post
+      changed_when: false
+      failed_when: false
+
+    - name: Assert OpenBao is initialized and unsealed
+      ansible.builtin.assert:
+        that:
+          - (bao_status_post.stdout | from_json).initialized | bool
+          - not ((bao_status_post.stdout | from_json).sealed | bool)
+        success_msg: >-
+          OpenBao is initialized, auto-unsealed via SoftHSM,
+          and serving TLS on {{ openbao_api_addr }}
+        fail_msg: >-
+          OpenBao status: {{ bao_status_post.stdout }}
+
   handlers:
     - name: Restart OpenBao
       ansible.builtin.systemd:
         name: openbao
         state: restarted
+
+    - name: Update CA trust
+      ansible.builtin.command: update-ca-trust extract
+      changed_when: true

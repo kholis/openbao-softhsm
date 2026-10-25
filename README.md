@@ -26,6 +26,35 @@ All variables such as token label, PINs, AES key label, and key type are configu
 | `softhsm_key_type`    | AES key type and length                | `aes:32`        |
 | `openbao_version`     | OpenBao HSM version                    | `2.5.1`         |
 
+## Rocky / EL8 Notes
+
+The playbook handles three EL8-specific quirks automatically:
+
+1. **OpenBao HSM packages** – OpenBao ≥ 2.6 ships PKCS#11 sealing via the
+   external plugin `openbao-plugin-kms-pkcs11` (no more separate `-hsm`
+   packages). The playbook installs the pinned plugin release and the
+   required `plugin "kms" "pkcs11"` server config block.
+
+2. **Plugin glibc requirements** – upstream plugin release binaries are
+   dynamically linked against glibc ≥ 2.32/2.34 while EL8 ships glibc 2.28.
+   The playbook detects this with `ldd` and falls back to building the
+   plugin from source with a pinned Go toolchain.
+
+3. **SoftHSM AES-GCM crash** – SoftHSM 2.6.x aborts inside
+   `C_EncryptInit`/`C_DecryptInit` when `CKM_AES_GCM` is used with an empty
+   AAD (which is exactly what OpenBao sends): `ByteString::operator[]`
+   hits a bounds assert under EL8's hardened libstdc++. Fixed upstream in
+   SoftHSM 2.7.0, which the playbook therefore builds into `/usr/local`
+   and the seal uses `/usr/local/lib/softhsm/libsofthsm2.so`.
+
+After convergence the playbook also initializes the server with PKCS#11
+auto-unseal (`bao operator init -recovery-shares=1 -recovery-threshold=1`),
+enables the KV v2 mount at `secret/`, and asserts that the node is
+initialized and **unsealed**. Initial credentials (root token + recovery
+key) are stored in `/root/init.json` (mode 0600). The CA and TLS flow uses
+a locally generated internal CA, trusted system-wide, so the CLI works via
+`BAO_ADDR` and `BAO_CACERT` from `/etc/profile.d/66-set-bao-addr.sh`.
+
 ## Manual Steps
 
 If you prefer to perform the setup manually without Ansible, the general steps are:
