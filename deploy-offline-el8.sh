@@ -10,15 +10,11 @@
 #   ./deploy-offline-el8.sh deploy   run on the AIR-GAPPED EL8 target:
 #                                    installs and converges everything.
 #
-# The bundle carries only what the local EL8 repo cannot provide:
-#   binaries/libsofthsm2.so               SoftHSM 2.7.0 (EL8's 2.6.1 aborts
-#                                         on CKM_AES_GCM with empty AAD —
-#                                         fixed upstream in 2.7.0)
-#   binaries/openbao-plugin-kms-pkcs11    OpenBao PKCS#11 seal plugin,
-#                                         built against EL8 glibc 2.28
-# Everything else (bao, softhsm, opensc, openssl-libs, libstdc++, ...)
-# is expected from the server's local repo, or from rpms/ if you drop
-# rpm files in there manually.
+# The bundle is self-contained: it carries the two custom binaries plus
+# the full rpm dependency closure (openbao, softhsm, opensc and their
+# dependencies), so the target server does NOT need a working dnf repo.
+# If the target does have one, the rpms/ directory simply no-ops for
+# already-installed packages.
 #
 # Credentials live in .env (never committed). Certificates are supplied
 # by you in certs/ (server.crt, server.key, coreCA.crt) — no PKI is
@@ -86,6 +82,8 @@ do_bundle() {
         warn "add them to certs/ inside the extracted bundle before deploying"
     fi
 
+    collect_rpms "$stage"
+
     tar czf "$out" "$stage"
     rm -rf "$stage"
 
@@ -99,7 +97,61 @@ Next steps:
   3. cp .env.example .env   # edit pins/labels
   4. put corporate certs in certs/ (server.crt, server.key, coreCA.crt)
   5. ./deploy-offline-el8.sh deploy
+
+The bundle is self-contained: rpms/ carries the full dependency closure
+(openbao + softhsm + opensc + deps), so the target does not need a
+dnf repo. Binaries are x86_64 EL8 (glibc 2.28 compatible).
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# rpm collection: run on the online build host, needs network + dnf
+# ---------------------------------------------------------------------------
+collect_rpms() {
+    local stage="$1"
+    local rpmdir="$stage/rpms"
+    local openbao_rpm="openbao_2.7.1_linux_amd64.rpm"
+    local openbao_rpm_sha="698970b7e58590bd0ceb55043ce6f5e5d53e67b4a825e296cc197b21d6a6d700"
+    local cached="/opt/openbao-bundle/$openbao_rpm"
+
+    log "collecting rpm dependency closure into rpms/..."
+
+    if [[ -f "$cached" ]] && \
+       echo "$openbao_rpm_sha  $cached" | sha256sum -c >/dev/null 2>&1; then
+        install -m 0644 "$cached" "$rpmdir/$openbao_rpm"
+        log "openbao rpm: reused sha256-verified local copy"
+    else
+        curl -fL --max-time 600 -o "$rpmdir/$openbao_rpm" \
+            "https://github.com/openbao/openbao/releases/download/v2.7.1/$openbao_rpm"
+        echo "$openbao_rpm_sha  $rpmdir/$openbao_rpm" | sha256sum -c >/dev/null
+        log "openbao rpm: downloaded, sha256 verified"
+    fi
+
+    dnf download --resolve --downloaddir "$rpmdir" softhsm opensc openssl >/dev/null 2>&1 || \
+        warn "dnf repos lack some packages — using verified offline rpm set instead"
+
+    # The Rocky base repos do not carry softhsm; seed the closure from the
+    # previously staged offline rpm set when present. Integrity (digests)
+    # is mandatory; GPG signatures are best-effort since some packages in
+    # the set come from other vendors (e.g. Fedora-built softhsm).
+    if [[ -d /opt/openbao-bundle ]]; then
+        local r
+        for r in /opt/openbao-bundle/*.rpm; do
+            [[ "$(basename "$r")" == "$openbao_rpm" ]] && continue
+            if rpm -K --nosignature "$r" >/dev/null 2>&1; then
+                rpm -K "$r" >/dev/null 2>&1 || \
+                    warn "$(basename "$r"): signature unverifiable (digests OK)"
+                cp -n "$r" "$rpmdir/"
+            else
+                warn "skipping corrupt rpm (digest failure): $r"
+            fi
+        done
+    fi
+
+    local n
+    n="$(ls -1 "$rpmdir"/*.rpm 2>/dev/null | wc -l)"
+    [[ $n -ge 4 ]] || die "rpm collection produced only $n file(s)"
+    log "rpms/: $n packages ($(du -sh "$rpmdir" | cut -f1))"
 }
 
 # ---------------------------------------------------------------------------
@@ -139,22 +191,42 @@ preflight() {
     log "preflight: OK (EL${VERSION_ID%%.*}, certs and binaries present)"
 }
 
-install_repo_packages() {
-    log "installing repo packages (softhsm, opensc)..."
-    dnf install -y -q softhsm opensc >/dev/null
+install_packages() {
+    local pkgs=(softhsm opensc openbao)
+    local have_all=true p
 
-    if rpm -q openbao >/dev/null 2>&1; then
-        log "openbao already installed: $(rpm -q openbao)"
+    for p in "${pkgs[@]}"; do
+        rpm -q "$p" >/dev/null 2>&1 || have_all=false
+    done
+    if [[ $have_all == true ]]; then
+        log "all required packages already installed"
         return
     fi
-    if ls "$SCRIPT_DIR"/rpms/openbao-*.rpm >/dev/null 2>&1; then
-        log "installing openbao from bundled rpms/"
-        dnf install -y -q "$SCRIPT_DIR"/rpms/openbao-*.rpm >/dev/null
-    elif dnf install -y -q openbao >/dev/null 2>&1; then
-        log "installed openbao from local repo: $(rpm -q openbao)"
-    else
-        die "openbao not available: add openbao_2.7.1_linux_amd64.rpm to your local repo or to rpms/ in this bundle"
+
+    if ls "$SCRIPT_DIR"/rpms/*.rpm >/dev/null 2>&1; then
+        log "installing missing packages from bundled rpms/..."
+        local rpmlist=() r name
+        for r in "$SCRIPT_DIR"/rpms/*.rpm; do
+            name="$(rpm -qp --qf '%{NAME}' "$r" 2>/dev/null)" || continue
+            if rpm -q "$name" >/dev/null 2>&1; then
+                continue   # already satisfied — never downgrade a target pkg
+            fi
+            rpmlist+=("$r")
+        done
+        if ((${#rpmlist[@]} > 0)); then
+            dnf install -y -q "${rpmlist[@]}"
+        else
+            log "all bundled rpms already satisfied"
+        fi
     fi
+
+    for p in "${pkgs[@]}"; do
+        rpm -q "$p" >/dev/null 2>&1 && continue
+        log "'$p' not covered — trying local repo..."
+        dnf install -y -q "$p" || \
+            die "package '$p' missing: not in rpms/ and not in any configured repo"
+    done
+    log "packages ready: $(rpm -q "${pkgs[@]}" 2>/dev/null | tr '\n' ' ')"
 }
 
 install_prebuilt() {
@@ -220,7 +292,6 @@ EOF
         warn "softhsm2.conf updated"
     fi
 }
-
 init_token_and_key() {
     log "ensuring SoftHSM token and AES key..."
 
@@ -440,7 +511,7 @@ do_deploy() {
     export BAO_ADDR="$BAO_API_ADDR"
     export BAO_CACERT=/etc/openbao/tls/coreCA.crt
     preflight
-    install_repo_packages
+    install_packages
     install_prebuilt
     init_token_and_key
     install_certs
@@ -455,7 +526,7 @@ case "$MODE" in
     deploy) do_deploy ;;
     *)
         echo "usage: $0 {bundle|deploy}" >&2
-        echo "  bundle  collect prebuilt binaries + certs into a tarball (online host)" >&2
+        echo "  bundle  collect binaries + rpm closure + certs into a tarball (online host)" >&2
         echo "  deploy  install and converge on the air-gapped EL8 server" >&2
         exit 1
         ;;

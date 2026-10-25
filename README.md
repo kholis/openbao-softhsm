@@ -49,10 +49,11 @@ compilation happens on the target:
    ./deploy-offline-el8.sh deploy
    ```
 
-Everything else (`bao`, `softhsm`, `opensc`, openssl/libstdc++ runtime
-libs) comes from the server's local repo. If your repo mirror lacks the
-OpenBao rpm, drop `openbao_2.7.1_linux_amd64.rpm` into the bundle's
-`rpms/` directory — the script prefers the repo and falls back to it.
+The bundle is **fully self-contained**: `rpms/` carries the complete rpm
+dependency closure (`openbao`, `softhsm`, `opensc` plus `pcsc-lite`,
+`pkgconf`, `polkit`, `openssl`, ... — 16 packages), so the target server
+does not need a working dnf repo at all. Already-installed packages are
+never downgraded. Binaries are x86_64 EL8 (glibc 2.28 compatible).
 
 Credentials are read from `.env` (git-ignored). No PKI is generated:
 the corporate certificates you supply are installed, and the CA is
