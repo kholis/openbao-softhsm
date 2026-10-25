@@ -26,6 +26,41 @@ All variables such as token label, PINs, AES key label, and key type are configu
 | `softhsm_key_type`    | AES key type and length                | `aes:32`        |
 | `openbao_version`     | OpenBao HSM version                    | `2.5.1`         |
 
+## Air-gapped / offline deployment (EL8)
+
+For servers without internet access, use `deploy-offline-el8.sh` — no
+compilation happens on the target:
+
+1. **On the online build host** (where the binaries were built):
+
+   ```bash
+   ./deploy-offline-el8.sh bundle
+   # → offline-el8-bundle-<date>.tar.gz containing the prebuilt
+   #   SoftHSM 2.7.0 library + OpenBao PKCS#11 plugin (EL8/glibc-2.28
+   #   compatible), .env.example, this script and certs/ if present
+   ```
+
+2. **On the air-gapped server** (EL8, x86_64, local dnf repo configured):
+
+   ```bash
+   tar xzf offline-el8-bundle-<date>.tar.gz && cd dist-offline-el8
+   cp .env.example .env        # pins/labels/addresses — never commit
+   # place corporate certs in certs/ (server.crt, server.key, coreCA.crt)
+   ./deploy-offline-el8.sh deploy
+   ```
+
+Everything else (`bao`, `softhsm`, `opensc`, openssl/libstdc++ runtime
+libs) comes from the server's local repo. If your repo mirror lacks the
+OpenBao rpm, drop `openbao_2.7.1_linux_amd64.rpm` into the bundle's
+`rpms/` directory — the script prefers the repo and falls back to it.
+
+Credentials are read from `.env` (git-ignored). No PKI is generated:
+the corporate certificates you supply are installed, and the CA is
+trusted system-wide so `bao` verifies the endpoint.
+
+`playbooks/site.yml` remains the online/Ansible reference implementation
+and documents the desired end state (TLS, raft, PKCS#11 seal, kv-v2).
+
 ## Rocky / EL8 Notes
 
 The playbook handles three EL8-specific quirks automatically:
