@@ -95,7 +95,7 @@
           - opensc
         state: present
 
-    - name: Build SoftHSM {{ softhsm_version }} from source
+    - name: Build SoftHSM from source {{ softhsm_version }}
       block:
         - name: Ensure SoftHSM build dependencies
           ansible.builtin.dnf:
